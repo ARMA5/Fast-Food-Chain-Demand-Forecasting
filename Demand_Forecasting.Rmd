@@ -1,0 +1,939 @@
+---
+title: "Demand Forecasting for A Fast Food Restaurant Chain"
+author: "Adeniyi Richard Michael-Adenuga"
+date: "2/25/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(knitr)
+library(ggplot2)
+library(gridExtra)
+library(forecast)
+library(tseries)
+library(lubridate)
+library(uroot)
+library(kableExtra)
+```
+
+# 1. Project Objectives
+The objective of this project is to forecast demand for lettuce for four individual restaurants owned by a large fast-food retail chain in the US that makes submarine sandwiches (subs), in order to enable managers make inventory replenshipment decisions. Towards this goal, the ARIMA and Holt-Winters models are employed and evaluated in order to forecast demand in the two-week window from 06/16/2015 to 06/29/2015. The data in the 06/16/2015 to 06/29/2015 window are unseen and the performance of the models will be judged based on Mean Squared Deviation. 
+
+# 2. Data Preprocessing
+The data is contained in 11 different datasets, ranging from POS transactional data, to recipes, portion amounts and ingredients:
+
+* pos_ordersale: Includes franchisee point of sale transaction data, "MD5KEY_ORDERSALE" a unique identifier of the order in the POS, date and the store number 
+
+* menuitem: Purchased menu item associated with a single transaction in pos_ordersale. Includes the quantity and price of item purchased, Id (unique identifier for associated menu item in menu_items),"MD5KEY_MENUITEM" a unique identifier for the purchased menu item, "MD5KEY_ORDERSALE" foreign key from pos_ordersale table
+
+* menu_item: Menu item associated with a franchisee recipe. Contains RecipeID (a unique identifier for the recipe and matches with recipes table), PLU (unique identifier for the recipe associated with this item) and MenuItemId
+
+* recipes: Table contains the recipe for a menu item
+
+* store_restaurant: Includes data on the store's/restaurant's location
+
+* recipes_ingredient_assignments: Includes the IngredientId for each recipe and the quantity specific ingredient used in that recipe
+
+* recipe_sub_recipe_assignments: Recipe for a specific sub
+
+* sub_recipes: Sub-recipe associated with a recipe
+
+* sub_recipe_ingr_assignments: Contains the ingredient within a sub-recipe
+
+* ingredients: An ingredient used in a franchisee recipe
+
+* portion_uom_types: Portion (or unit of measurement) for an ingredient
+
+These datasets are read in: 
+```{r}
+ingredients<-read.csv(file="/Users/arma/Desktop/Data/ingredients.csv", header= TRUE, sep=",")
+menu_items<-read.csv(file="/Users/arma/Desktop/Data/menu_items.csv", header= TRUE, sep=",")
+menuitem<-read.csv(file="/Users/arma/Desktop/Data/menuitem.csv", header= TRUE, sep=",")
+portion_uom_types<-read.csv(file="/Users/arma/Desktop/Data/portion_uom_types.csv", header= TRUE, sep=",")
+pos_ordersale<-read.csv(file="/Users/arma/Desktop/Data/pos_ordersale.csv", header= TRUE, sep=",")
+recipe_ingredient_assignments<-read.csv(file="/Users/arma/Desktop/Data/recipe_ingredient_assignments.csv", header= TRUE, sep=",")
+recipe_sub_recipe_assignments<-read.csv(file="/Users/arma/Desktop/Data/recipe_sub_recipe_assignments.csv", header= TRUE, sep=",")
+recipes<-read.csv(file="/Users/arma/Desktop/Data/recipes.csv", header= TRUE, sep=",")
+sub_recipe_ingr_assignments<-read.csv(file="/Users/arma/Desktop/Data/sub_recipe_ingr_assignments.csv", header= TRUE, sep=",")
+sub_recipes<-read.csv(file="/Users/arma/Desktop/Data/sub_recipes.csv", header= TRUE, sep=",")
+```
+
+```{r}
+library(readxl)
+store_restaurant<-read_excel("/Users/arma/Desktop/Data/store_restaurant.xlsx", col_names = TRUE)
+```
+
+The aim of this section is to calculate the total quantity of lettuce demanded each day for each store, this is done as follows:
+
+1. Find all the recipes with lettuce (lettuce IngredientId=27) included
+```{r}
+lettuce_recipes<-recipe_ingredient_assignments[recipe_ingredient_assignments$IngredientId==27,]
+```
+
+2. Since lettuce can also enter the recipes via the subs, we must also account for this
+```{r}
+subs_with_lettuce<-sub_recipe_ingr_assignments[sub_recipe_ingr_assignments$IngredientId==27,] #Lettuce only
+subs_lettuce_recipes<- inner_join(subs_with_lettuce,recipe_sub_recipe_assignments, by="SubRecipeId") #Inorder to get RecipeId and Factor 
+subs_lettuce_recipes<- subs_lettuce_recipes %>% mutate(lettuce_weight=Quantity*Factor) #Total amount of lettuce in each sub recipe is given by factor * quantity 
+aggregated_subs_lettuce<- subs_lettuce_recipes %>% group_by(RecipeId,IngredientId) %>% summarise(lettuce_used=sum(lettuce_weight)) #Sums up lettuce used for each RecipeId
+```
+
+3. Combine lettuce_recipes and aggregated_subs_lettuce
+```{r}
+colnames(aggregated_subs_lettuce)[3]<-"Quantity" #Rename so as to match the titles in lettuce_recipes
+lettuce_recipes<- as.data.frame(lettuce_recipes)
+aggregated_subs_lettuce<- as.data.frame(aggregated_subs_lettuce)
+all_lettuce_recipes<-rbind(lettuce_recipes, aggregated_subs_lettuce)
+total_lettuce_recipes<- all_lettuce_recipes %>% group_by(RecipeId) %>%  summarise(lettuce_quantity=sum(Quantity))
+```
+
+4. Find out how much is sold each day in the shops
+```{r}
+menu<-inner_join(menuitem, menu_items, by = c("Id" = "MenuItemId")) #Inorder to get Quantity Purchased
+lettuce_menu_item<-inner_join(menu, total_lettuce_recipes, by="RecipeId")
+lettuce_menu_item$lettuce_demand<- lettuce_menu_item$Quantity * lettuce_menu_item$lettuce_quantity
+lettuce_menu_item$date<-as.Date(lettuce_menu_item$date, format="%y-%m-%d") #Make date column a date object
+```
+
+5. Split into separate store locations and add up orders
+```{r}
+cali1<- lettuce_menu_item[lettuce_menu_item$StoreNumber==46673,]
+cali2<- lettuce_menu_item[lettuce_menu_item$StoreNumber==4904,]
+ny1<- lettuce_menu_item[lettuce_menu_item$StoreNumber==12631,]
+ny2<- lettuce_menu_item[lettuce_menu_item$StoreNumber==20974,]
+
+#Aggregate lettuce demanded
+cali1<- cali1 %>% arrange(date) %>% group_by(date) %>% summarise(aggregate_weight=sum(lettuce_demand))
+cali2<- cali2 %>% arrange(date) %>% group_by(date) %>%  summarise(aggregate_weight=sum(lettuce_demand))
+ny1<- ny1 %>% arrange(date) %>% group_by(date) %>% summarise(aggregate_weight=sum(lettuce_demand))
+ny2<- ny2 %>% arrange(date) %>% group_by(date) %>% summarise(aggregate_weight=sum(lettuce_demand))
+```
+
+Upon inspecting NY2, it can be seen that there are time gaps in the first 6 rows. The non consecutive days would make fitting a time series model problematic therefore, these six rows are removed.
+```{r}
+ny2<-ny2[-c(1:6),]
+```
+
+# 3. ARIMA Models
+This section begins with a qualitative assessment of the time series plots seen for each of the shops, by looking for evidence of seasonality, trend, cyclicity and stationarity. 
+```{r}
+p1<- cali1 %>% ggplot(aes(x=date,y=aggregate_weight)) + geom_line() + ggtitle("Cali1") +ylab("Lettuce Demand")
+p2<- cali2 %>% ggplot(aes(x=date,y=aggregate_weight)) + geom_line() + ggtitle("Cali2") +ylab("Lettuce demand")
+p3<- ny1 %>% ggplot(aes(x=date,y=aggregate_weight)) + geom_line() + ggtitle("NY1") +ylab("Lettuce demand")
+p4<- ny2 %>% ggplot(aes(x=date,y=aggregate_weight)) + geom_line() + ggtitle("NY2") +ylab("Lettuce demand")
+grid.arrange(p1, p2, p3, p4, nrow = 2)
+```
+
+**1. Cali1 Store:** Given that the data available spans March to June 2015, there is not enough data to determine if there is infact cyclicity and this will subsequently be ignored. Additionally, there appears to be little to no evidence of trend in the plot of Cali1 (no overall increase). However, within the months, there is evidence of weekly seasonality (frequency of 7 days). Finally, the mean and the variance appear to be roughly constant, implying trend stationarity.
+
+**2. Cali2 Store:**  Similar to the Cali1 Store above, Cali2 exhibits no observable trend and there appears to be weekly seasonality also. As above, mean and variance appear to be roughly constant, implying trend stationarity. 
+
+**3. NY1:** By contrast, the mean and variance for NY1 appear to not be constant and consequently appears non-stationary. Additionally, seasonality is also evident.
+
+**4. NY2:** In NY2, mean and variance are roughly constant, indicating trend stationarity. 
+
+For fitting the ARIMA models, the Box-Jenkins procedure is followed: 
+
+1. Identification: Pre-processing of the data to make it stationary - stationarity is observed by the autocorrelations decaying to zero exponentially. Once the timeseries is stationary, an ARIMA model is fit using indicative parameters determined by ACF and PACF.
+
+2. Estimation: The parameters are decided based on information criteria (AIC/BIC).
+
+3. Verification: Model fit to the data is determined by performing residual analyses - visual inspection of the distribution of residuals as well as formal tests such as Ljung-Box.
+
+## 3.1 Cali1 Store
+
+### 3.11 Stationarize The Time Series
+**Train/Test Split:**  At the start of this analysis, we split the data into a train and test sets. The Cali1 dataset has 103 observations and subsequent analyses are performed with an 80/20 train-test split. Consequently, the models are trained with data from the 5th of March 2015 to the 25th of May 2015 (1st observation to the 82nd). As noted above, given that the data are sampled daily, the time series will be formulated with a frequency of 7. 
+
+```{r}
+cali1_train<-cali1[1:82,] #Train on the first 82 observations
+cali1_train<-ts(cali1_train[,2],frequency = 7, start=c(03,05)) #Make ts object
+cali1_test<-cali1[83:dim(cali1)[1],] #Test on from 83rd to last
+cali1_test<-ts(cali1_test[,2],frequency = 7, start=c(15,3)) #Make ts object
+```
+
+The plots of the timeseries, ACF and PACF are observed:
+```{r}
+ggtsdisplay(cali1_train) #Look at timeseries, ACF, PACF plots for Cali1 Store
+```
+
+As seen from the ACF plot above, there are spikes occuring at lags that are a multiple of 7 (7, 14 and 21), reinforcing the earlier conclusion that seasonality occurs with a period of 7 days. 
+
+In section 3 above, it was assumed that the Cali1 timeseries was trend stationary. This is verified by utilising the _ndiffs()_ function in order to determine the number of  first-order differences required to stationarise the timeseries - as expected, this returns 0.
+```{r}
+ ndiffs(cali1_train) #Number of first order differences required to stationarise the time series. 
+```
+From observing the timeseries above, one observes that the magnitude of the seasonal fluctuations does not vary with the level of the time series. Therefore, it is assumed that the seasonal component is additive and in order to find the _nsdiffs()_ function is used.
+```{r}
+ nsdiffs(cali1_train) #Number of seasonal differences required to stationarise the time series.
+```
+As seen above one seasonal difference needs to be taken. 
+```{r}
+cali1_ts_diff<- diff(cali1_train, lag = 7) #One seasonal difference
+```
+This new differenced object is visually observed:
+```{r}
+autoplot(cali1_ts_diff) + labs(y="Differenced Lettuce Demand for Cali 1")
+```
+As seen above, the plot appears stationary with the season component removed. Stationarity is formally tested by applying the Augemented Dickey-Fuller (ADF), Phillips-Perron (PP) and Kwiatkowski-Phillips-Schmidt-Shin (KPSS) tests. The ADF and PP test the null hypothesis that there is a unit root in the time series i.e. non-stationary. Conversely, the KPSS test the null hypothesis that the timeseries is trend stationary. 
+
+```{r}
+adf.test(cali1_ts_diff) #ADF Test
+pp.test(cali1_ts_diff) #PP Test
+kpss.test(cali1_ts_diff) #KPSS Test
+```
+As seen, the null hypothesis is rejected for the ADF and PP test, while the null cannot be rejected for the KPPS at a significance level of 5%. Thus, it is concluded that the timeseries is adequately stationarised. 
+
+### 3.12 Parameter Estimation
+
+With the now stationarised timeseries, the next step in the analysis is to determine the orders of the MA and AR components based on ACF and PACF. The PACF is expected to give an indication of the order of the AR component, while the ACF is expected to give that of the MA component. As no trend first order differences were required potential models will be of the form ARIMA(p,0,q)(P,1,Q)(7)
+```{r}
+cali1_acf<-acf(cali1_ts_diff, lag.max = 21, plot= FALSE) #ACF of Differenced Data
+plot(cali1_acf, main= "Cali 1 Store ACF")
+cali1_pacf<-pacf(cali1_ts_diff,lag.max = 21, plot=FALSE) #PACF of Differenced Data
+plot(cali1_pacf, main= "Cali 1 Store PACF")
+```
+
+In the ACF plot, it can be seen that the only significant lag is at 7. In the PACF plot, beyond the significant lag at 7,  an exponential decay pattern can be seen in subsequent seasonal lags. Of the ~ 20 lags shown in the plots, with a confidence interval of 95%, one would expect 1 of the spikes in both plots to be erroneously significant. It is for this reason that the "slightly" significant lags (lags 11 in the ACF plot and 15 in the PACF plot) are ignored. Consequently, P and Q are expected to be less than or equal to 1 - providing support for a candidate model such as: ARIMA(0,0,0)(1,1,1)[7]. 
+
+The auto.arima function is then used in order to select the optimal orders based on the information criteria. 
+```{r}
+auto.arima(cali1_train, trace = FALSE, approximation = FALSE, stepwise = FALSE, ic = c("aicc", "aic", "bic")) 
+```
+The "best" model is given by ARIMA(1,0,0)(0,1,1)[7]. The seasonal portion is easily reconciled with the anlysis above - as there is a spike in the ACF at lag 7  and exponential decay patterns in the PACF seasonal lags. However, the surprise comes from the p=1 component as one would expect to see significant spikes in the early lags of the PACF in order to support this. Nonetheless, this model is selected as a candidate model to be tested further. 
+
+The above results, based on the information criteria, are summarised as follows:
+
+1. Best Model: ARIMA(1,0,0)(0,1,1)[7]
+
+2. Second Best Model: ARIMA(0,0,1)(0,1,1)[7] 
+
+Since the model expected from observing the ACF and PACF plots is amongst the top performers, it is also selected as a candidate model. 
+
+3. Model Expected from PACF/ACF Plots: ARIMA(0,0,0)(1,1,1)[7]
+
+```{r}
+#Coding the three candidate models
+cali.m1<-Arima(cali1_train, order = c(1,0,0), seasonal = list(order = c(0, 1, 1), period=7))
+cali1.m2<-Arima(cali1_train, order = c(0,0,1), seasonal = list(order = c(0, 1, 1), period=7))
+cali1.m3<-Arima(cali1_train, order = c(0,0,0), seasonal = list(order = c(1, 1, 1), period=7))
+```
+
+### 3.13 Verification
+
+**In Sample Performance** 
+
+This section begins with the an evalution of the in-sample performance of the models above:
+
+```{r}
+cali1_in_sample<-as.data.frame(accuracy(cali.m1))
+cali1_in_sample<-rbind(cali1_in_sample,accuracy(cali1.m2))
+cali1_in_sample<-rbind(cali1_in_sample, accuracy(cali1.m3))
+cali1_in_sample$Model<- c("Model 1", "Model 2", "Model 3")
+cali1_in_sample<- cali1_in_sample %>% select(Model, everything())
+row.names(cali1_in_sample) <- NULL
+cali1_in_sample %>% kable(caption = "In Sample Performance") %>%  kable_styling("striped")
+```
+From the results of the table above, it is seen that Model 1 perfoms the best on all metrics. This outcome is not surprising as this was the model selected by a range of information criteria, including BIC. These criteria, especially the BIC, select the models based on a balance between fit and parsimony - consequently, one would expect the best model selected by this procedure to exhibit the best performance.
+
+Nonetheless, the out of sample performance of these three models will be tested in order to evaluate how well they generalise on unseen data. 
+
+**Out of Sample Performance**
+
+When considering the evaluation of out-of-sample performance of ARIMA models, there are two approaches: one based on a one-step ahead forecast and another based on multi-step ahead forecast. In reality, as lettuce is considered fresh produce and there are likely to be many producers, one could argue that fast-food chains are unlikely to place orders for lettuce too far in advance - this is reflective of a supply chain that is likely to be quite responsive. However, as the output of this report is a forecast for the next 14 days from the end of the available data, the model performance on the multistep ahead forecast will be prioritised. 
+
+```{r}
+#Out of sample performance 
+cali1_out_sample<-as.data.frame(accuracy(forecast(cali.m1, h = 20), cali1_test))
+cali1_out_sample<-rbind(cali1_out_sample,accuracy(forecast(cali1.m2, h = 20), cali1_test))
+cali1_out_sample<-rbind(cali1_out_sample,accuracy(forecast(cali1.m3, h = 20), cali1_test))
+cali1_out_sample$Model<- c("Model 1","Model 1", "Model 2", "Model 2","Model 3","Model 3")
+cali1_out_sample<- cali1_out_sample %>% select(Model, everything())
+cali1_out_sample %>% kable(caption = "Out of Sample Performance") %>%  kable_styling("striped")
+```
+
+```{r}
+#Plot Forecasts
+cali1_m1_plot<-autoplot(forecast(cali.m1, h = 20))
+cali1_m2_plot<-autoplot(forecast(cali1.m2, h = 20))
+cali1_m3_plot<-autoplot(forecast(cali1.m3, h = 20))
+grid.arrange(cali1_m1_plot, cali1_m2_plot, cali1_m3_plot, nrow = 2)
+```
+
+As expected, the perfomance of all the models is worse on the test set than on the training set. As seen, model 1 continues to perform the best across most of the evaluation Metrics. However, special attention is paid to the RMSE due to its sensitivity to large errors. For this reason, Model 1 is selected over the other models evaluated. 
+
+However, before Model 1 is formally selected and used to make predictions for the subsequent 14 days, its residuals are checked: 
+```{r}
+#Check Residuals
+checkresiduals(cali.m1)
+```
+Ideally, there should be no autocorrelations in the residuals and this is evidenced by "white-noise" pattern seen in the time series, no significant spikes in the ACF plot and normally distributed residuals with mean 0. Further more, these are supported by the Ljung-Box test, with the null hypothesis that the model does not show a lack of fit. 
+
+The timeseries of the residuals above generally exhibits a white noise like pattern, although there appears to be a slight downwards trajectory in the later lags. There are two significant lags in the ACF plot. On account of random variations and their small value above the threshold, these are deemed acceptable. Finally, the Ljung-Box test returns a p-value of 0.2215, indicating that null hypothesis cannot be rejected. Model 1 is therefore considered satisfactory and will be compared against the Holt-Winters model in order to decide on which should be used for the final prediction.
+
+## 3.2 Cali2 Store
+
+### 3.21 Stationarize The Time Series
+
+**Train/Test Split:** As before, the dataset is split into a training and test set.  There are 95 observations in the Cali2 dataset and subsequent analyses are performed with an 80/20 train-test split. The models are trained on data from the 13th of March 2015 to the 27th of May 2015 (1st observation to the 76th). 
+```{r}
+cali2_train<-cali2[1:76,] #Train on the first 76 observations
+cali2_train<-ts(cali2_train[,2],frequency = 7, start=c(03,13)) #Make ts object
+cali2_test<-cali2[77:dim(cali2)[1],] #Test on from 77th to last
+cali2_test<-ts(cali2_test[,2],frequency = 7, start=c(15,5)) #Make ts object
+```
+
+The plots of the timeseries, ACF and PACF are observed:
+```{r}
+ggtsdisplay(cali2_train) #Look at timeseries, ACF, PACF plots for Cali2 Store
+```
+
+As expected, in the ACF plot there are significant spikes occuring at lag 7 and multiples of 7 (14 and 21), confirming the seasonality. 
+
+The trend stationarity of the plot above is confirmed by using the ndiffs() function- as expected, this returns 0. 
+```{r}
+ndiffs(cali2_train) #Number of first order differences required to stationarise the time series.
+```
+```{r}
+nsdiffs(cali2_train)
+```
+As seen above, one seaonal difference needs to be taken. 
+```{r}
+cali2_diff<-diff(cali2_train,lag=7)
+```
+This new differenced object is visually observed:
+```{r}
+autoplot(cali2_diff) + labs(y="Differenced Lettuce Demand for Cali 2")
+```
+
+```{r}
+adf.test(cali2_diff) 
+```
+```{r}
+pp.test(cali2_diff) 
+```
+```{r}
+kpss.test(cali2_diff) 
+```
+The conclusion derived from the ADF  and KPSS test is that the time series is still not stationary. However, the PP test suggests that the time series is in fact stationay, as the null hypothesis is rejected with a p-value of 0.01. Upon observing the differenced time series plot above, it is seen that there appears to be a slight downwards trend, supporting the case for a trend difference to be taken. 
+
+```{r}
+#Take a trend difference on the already seasonally differenced cali2_diff. How many differences to take?
+ndiffs(cali2_diff)
+```
+```{r}
+#Take a trend difference on the already seasonally differenced cali2_diff
+cali2_diff_2<-diff(cali2_diff, differences=1)
+```
+The ADF, PP and KPSS tests are then performed again to ensure stationarity. 
+```{r}
+#ADF Test
+adf.test(cali2_diff_2)
+```
+```{r}
+#PP Test
+pp.test(cali2_diff_2)
+```
+```{r}
+#PP Test
+kpss.test(cali2_diff_2)
+```
+As the stationarity outcome is consistent from all three tests in the case of the doubly-differenced data (cali2_diff_2), further analysis on ACF/PACF is performed. 
+
+### 3.22 Parameter Estimation
+```{r}
+#ACF
+cali2_acf<-acf(cali2_diff_2, lag.max=21, plot=FALSE)
+plot(cali2_acf, main= "Cali 2 Store ACF")
+
+#PACF
+cali2_pacf<-pacf(cali2_diff_2, lag.max=21, plot=FALSE)
+plot(cali2_pacf, main= "Cali 2 Store PACF")
+```
+From the ACF plot, there are significant spikes at lag 1 and lag 7. This suggests a non-seasonal MA(1) component, as well as a seasonal MA(1) component. Similarly, the significant spike at lag 1 of the PACF is suggestive of an AR(1). None of the spikes at the seasonal lags in the PACF plot is significant. 
+
+The auto.arima function is run in order to return the optimal model order, based on the information criteria.
+
+```{r}
+auto.arima(cali2_train, trace = FALSE, approximation = FALSE, stepwise = FALSE, ic = c("aicc", "aic", "bic")) 
+```
+The best model is given by ARIMA(0,1,1)(0,1,1)[7] and the second best model is given by  ARIMA(0,1,1)(1,1,1)[7]. This outcome is consistent with the analysis above - given the significant spike in the ACF plot at lag 1, an MA(1) component is not surprising. Additionally, the seasonal MA(1) component is explained by the significant spike at lag 7 in the ACF plot.
+
+The "best" model and the second best model (given by ARIMA(0,1,1)(1,1,1)[7]) are evaluated based on their in-sample and out of sample performance. 
+
+```{r}
+#Coding the two candidate models
+cali2.m1<-Arima(cali2_train, order = c(0,1,1), seasonal = list(order = c(0, 1, 1), period=7))
+cali2.m2<-Arima(cali1_train, order = c(0,1,1), seasonal = list(order = c(1, 1, 1), period=7))
+```
+
+### 3.23 Verification
+
+**In Sample Performance:**
+```{r}
+cali2_in_sample<-as.data.frame(accuracy(cali2.m1))
+cali2_in_sample<-rbind(cali2_in_sample,accuracy(cali2.m2))
+cali2_in_sample$Model<- c("Model 1", "Model 2")
+cali2_in_sample<- cali2_in_sample %>% select(Model, everything())
+row.names(cali2_in_sample) <- NULL
+cali2_in_sample %>% kable(caption = "In Sample Performance") %>%  kable_styling("striped")
+```
+The results are a mixed bag, however, Model 2 outperforms Model 1 on RMSE. The out of sample performance of these two models is also assesed. 
+
+**Out of Sample Performance:**
+```{r}
+#Out of sample performance 
+cali2_out_sample<-as.data.frame(accuracy(forecast(cali2.m1, h = 19), cali2_test))
+cali2_out_sample<-rbind(cali2_out_sample,accuracy(forecast(cali2.m2, h = 19), cali2_test))
+cali2_out_sample$Model<- c("Model 1","Model 1", "Model 2", "Model 2")
+cali2_out_sample<- cali2_out_sample %>% select(Model, everything())
+cali2_out_sample %>% kable(caption = "Out of Sample Performance") %>%  kable_styling("striped")
+```
+
+```{r}
+#Plot Forecasts
+cali2_m1_plot<-autoplot(forecast(cali2.m1, h = 19))
+cali2_m2_plot<-autoplot(forecast(cali2.m2, h = 19))
+grid.arrange(cali2_m1_plot, cali2_m2_plot, nrow = 1)
+```
+As Model 1 outperforms Model 2 on the out of sample test, it is selected. Finally, its residuals are checked. 
+```{r}
+checkresiduals(cali2.m1)
+```
+Model 1 provides a satisfactory fit for the data: the time series plot of the residuals displays white noise patterns and the residuals are normally distributed with mean zero. The spike at lag 8 crosses the threshold. With about 20 lags, This can be attributed to random errors as ~1 of the spikes is expected to be erroneously classified. Finally, this is supported by the large p value in the Ljung-Box test of about 0.2.
+
+## 3.3 NY1 Store
+
+### 3.31 Stationarize The Time Series
+
+**Train/Test Split**: The 103 observations are split into a training/test set using the 80-20 split. 
+```{r}
+ny1_train<-ny1[1:82,] #Train on first 82 observations
+ny1_train<-ts(ny1_train[,2],frequency = 7, start=c(03,05)) #Make ts object
+ny1_test<-ny1[83:dim(ny1)[1],] #Test on from 83rd to last
+ny1_test<-ts(ny1_test[,2],frequency = 7, start=c(15,3)) #Make ts object
+```
+
+The plots of the timeseries, ACF and PACF are observed:
+```{r}
+ggtsdisplay(ny1_train) #Look at timeseries, ACF, PACF plots for NY1 Store
+```
+As mentioned earlier on, the mean and variance of the time series appear not to be constant (actually increasing over time) and consequently, indicative of multiplicative seasonal component. Consequently this appaears to be a candidate for the Box-Cox/logarithmic transformation. 
+
+```{r}
+ny1_train_transformed<-log(ny1_train)
+autoplot(ny1_train_transformed) + labs(y="Log(Lettuce Demand for NY 1)")
+```
+The magnitude of the variations appear to be more stable after being transformed. 
+
+```{r}
+#How many differences need to be taken in order to stationarise
+ndiffs(ny1_train_transformed)
+```
+```{r}
+#How many seasonal differences need to be taken in order to stationarise
+nsdiffs(ny1_train_transformed)
+```
+
+Consequently, the timeseries is differenced as follows:
+```{r}
+#How many differences need to be taken in order to stationarise
+ny1_train_transformed_diff<-diff(ny1_train_transformed, differences = 1)
+```
+The stationarity tests are perfomed to ensure it is infact stationary.
+```{r}
+adf.test(ny1_train_transformed_diff)
+```
+```{r}
+pp.test(ny1_train_transformed_diff)
+```
+```{r}
+kpss.test(ny1_train_transformed_diff)
+```
+
+All three tests indicate that the timeseries has been stationarized. 
+
+### 3.32 Parameter Estimation
+
+Possible models will be of the form ARIMA(p,1,q)(P,0,Q)[7]. In identifying possible orders, the ACF and PACF plots are analysed. 
+
+```{r}
+#ACF
+ny1_acf<-acf(ny1_train_transformed_diff, lag.max=21, plot=FALSE)
+plot(ny1_acf, main= "NY 1 Store ACF")
+
+#PACF
+ny1_pacf<-pacf(ny1_train_transformed_diff, lag.max=21, plot=FALSE)
+plot(ny1_pacf, main= "NY 1 Store PACF")
+
+```
+
+From the observation of the ACF plot, the significant spike at lag 1 and lag 7 are indicative of orders q and  Q of <=1. Conversely, from the observation of the PACF plot, the lags appear to stop being significant after lag 6. Consequently, orders of p <=5 are expected. 
+
+The auto.arima function is then used in order to select the optimal orders based on the information criteria.
+```{r}
+auto.arima(ny1_train, lambda = 0, trace = FALSE, approximation = FALSE, stepwise = FALSE, ic = c("aicc", "aic", "bic")) 
+```
+The best model is given by ARIMA(0,1,1)(2,0,0)[7] and the second best model is given by  ARIMA(0,1,1)(1,0,0)[7]. These two candidate models will be evaluated, in order to judge their out of sample performance. 
+
+**Bias Adjustment:** An issue that arises with the Box-Cox transformation is that the back transformed point forecast is usually the median as opposed to the mean. Considering that the fast food chain would most likely like to add up all the forecasted demand for each of the restaurants in order to plan lettuce delivery/inventory, the mean is preferred.  This has been achieved by setting the biasadj argument in the Arima function to TRUE. 
+
+```{r}
+ny1.m1<-Arima(ny1_train, order = c(0,1,1), seasonal = list(order = c(2, 0, 0), period=7), lambda = 0, include.mean = FALSE, biasadj = TRUE)
+ny1.m2<-Arima(ny1_train, order = c(0,1,1), seasonal = list(order = c(1, 0, 0), period=7), lambda = 0, include.mean = FALSE, biasadj = TRUE)
+```
+
+### 3.33 Verification
+
+**In Sample Performance**
+```{r}
+ny1_in_sample<-as.data.frame(accuracy(ny1.m1))
+ny1_in_sample<-rbind(ny1_in_sample,accuracy(ny1.m2))
+ny1_in_sample$Model<- c("Model 1", "Model 2")
+ny1_in_sample<- ny1_in_sample %>% select(Model, everything())
+row.names(ny1_in_sample) <- NULL
+ny1_in_sample %>% kable(caption = "In Sample Performance") %>%  kable_styling("striped")
+```
+
+Model 1 performs the best on most of the metrics, especially on the RMSE. The models are subsequently evaluated on their out of sample performance. 
+
+**Out of Sample Performance:**
+```{r}
+#Out of sample performance 
+ny1_out_sample<-as.data.frame(accuracy(forecast(ny1.m1, h = 20), ny1_test))
+ny1_out_sample<-rbind(ny1_out_sample,accuracy(forecast(ny1.m2, h = 20), ny1_test))
+ny1_out_sample$Model<- c("Model 1","Model 1", "Model 2", "Model 2")
+ny1_out_sample<- ny1_out_sample %>% select(Model, everything())
+ny1_out_sample %>% kable(caption = "Out of Sample Performance") %>%  kable_styling("striped")
+```
+```{r}
+#Plot Forecasts
+ny1_m1_plot<-autoplot(forecast(ny1.m1, h = 20))
+ny1_m2_plot<-autoplot(forecast(ny1.m2, h = 20))
+grid.arrange(ny1_m1_plot, ny1_m2_plot, nrow = 1)
+```
+
+As expected, both models perform worse on the test set. Nonetheless, Model 1 out performs Model 2 on most performance metrics, especially the RMSE and is therefore selected.
+
+Finally, the residuals from Model 1 are evaluated:
+```{r}
+checkresiduals(ny1.m1)
+```
+
+By all indications, model 1 provides a satisfactory fit for the data: the time series plot of the residuals displays white noise patterns, none of the spikes in the ACF plot are significant and the residuals are normally distributed with mean zero. Finally, this is supported by the large p value in the Ljung-Box test. 
+
+## 3.4 NY2 Store
+
+### 3.41 Stationarize The Time Series
+
+**Train/Test Split:** There are 88 observation in the NY2 dataset and they will be split 80/20 into the training-test set.
+```{r}
+ny2_train<-ny2[1:70,] #Train on first 70 observations
+ny2_train<-ts(ny2_train[,2],frequency = 7, start=c(03,20)) #Make ts object
+ny2_test<-ny2[71:dim(ny2)[1],] #Test on from 71st to last
+ny2_test<-ts(ny2_test[,2],frequency = 7, start=c(15,6)) #Make ts object
+```
+
+The plot of the timeseries, ACF and PACF are observed:
+```{r}
+ggtsdisplay(ny2_train) #Look at timeseries, ACF, PACF plots for NY2 Store
+```
+
+The timeseries above appears to be trend stationary. However, this is confirmed by using the ndiffs function to see if any differences need to be taken. 
+
+```{r}
+#How many differences need to be taken in order to stationarise
+ndiffs(ny2_train)
+```
+
+No differences need to be taken. 
+
+```{r}
+#How many seasonal differences need to be taken in order to stationarise
+nsdiffs(ny2_train)
+```
+Consequently, the time series appears to stationary in terms of trend and seasonality, therefore models are expected to be of the sum ARIMA(p,0,q)(P,0,Q)[7]. The stationarity is confirmed by performing ADF, PP and KPSS tests. 
+
+```{r}
+adf.test(ny2_train) #ADF Test
+```
+
+```{r}
+pp.test(ny2_train) #PP Test
+```
+```{r}
+kpss.test(ny2_train) #KPSS Test
+```
+The KPSS and PP test confirm the stationarity. Given that the the p-value of the ADF is only slightly above the 5% threshold, the above model is considered to be stationary. 
+
+### 3.42 Parameter Estimation
+```{r}
+#ACF
+ny2_acf<-acf(ny2_train, lag.max=21, plot=FALSE)
+plot(ny1_acf, main= "NY 2 Store ACF")
+
+#PACF
+ny2_pacf<-pacf(ny2_train, lag.max=21, plot=FALSE)
+plot(ny2_pacf, main= "NY 2 Store PACF")
+```
+
+Given the significant spikes in the ACF at the first lag and lag 7, are suggestive of q and Q<=1. In the PACF plot, the first spike at lag 1 is significant while that at lag 7 appears to just be at the boundary. 
+
+The auto.arima  function is then used in order to select the optimal orders based on the information criteria.
+```{r}
+auto.arima(ny2_train, trace = FALSE, approximation = FALSE, stepwise = FALSE, ic = c("aicc", "aic", "bic")) 
+```
+The best model is given by ARIMA(1,0,0)(1,0,0)[7] and the second best is given by ARIMA(0,0,1)(1,0,0)[7] with non-zero mean. The AR(1) component  in the "best model" is explained by significant spike in the PACF at lag 1, while the seasonal-AR(1) is explained by the spike at lag 7 in the PACF that reaches the significance boundary.  
+
+```{r}
+#Coding the three candidate models
+ny2.m1<-Arima(ny2_train, order = c(1,0,0), seasonal = list(order = c(1, 0, 0), period=7))
+ny2.m2<-Arima(ny2_train, order = c(0,0,1), seasonal = list(order = c(1, 0, 0), period=7))
+```
+
+### 3.43 Verification
+```{r}
+ny2_in_sample<-as.data.frame(accuracy(ny2.m1))
+ny2_in_sample<-rbind(ny2_in_sample,accuracy(ny2.m2))
+ny2_in_sample$Model<- c("Model 1", "Model 2")
+ny2_in_sample<- ny2_in_sample %>% select(Model, everything())
+row.names(ny2_in_sample) <- NULL
+ny2_in_sample %>% kable(caption = "In Sample Performance") %>%  kable_styling("striped")
+```
+As seen, Model 1 out performs Model 2 and the out of sample performance of both models is tested.
+```{r}
+#Out of sample performance 
+ny2_out_sample<-as.data.frame(accuracy(forecast(ny2.m1, h = 18), ny2_test))
+ny2_out_sample<-rbind(ny2_out_sample,accuracy(forecast(ny2.m2, h = 18), ny2_test))
+ny2_out_sample$Model<- c("Model 1","Model 1", "Model 2", "Model 2")
+ny2_out_sample<- ny2_out_sample %>% select(Model, everything())
+ny2_out_sample %>% kable(caption = "Out of Sample Performance") %>%  kable_styling("striped")
+```
+The performance on Model 1 and Model 2 are quite close on the out-of-sample test. However, Model 2 is selected over Model 1 due to its slightly better performance on the RMSE. 
+```{r}
+#Plot Forecasts
+ny2_m1_plot<-autoplot(forecast(ny2.m1, h = 18))
+ny2_m2_plot<-autoplot(forecast(ny2.m2, h = 18))
+grid.arrange(ny2_m1_plot, ny2_m2_plot, nrow = 1)
+```
+
+Finally, the residuals from Model 2 are evaluated:
+```{r}
+checkresiduals(ny2.m2)
+```
+Model 2 provides a satisfactory fit for the data (in spite of the long tail in the histogram): the time series plot of the residuals displays white noise patterns, none of the spikes in the ACF plot are significant and the residuals are normally distributed with mean zero. Finally, this is supported by the large p value in the Ljung-Box test.
+
+# 4. Holt-Winters Models
+
+In this portion of the analysis, the time series is modelled using the ets() function as opposed to the HoltWinters() function, due to the in-built optimisation of initial states and smoothing parameters via the maximisation of the likelihood function. Three steps are followed:
+
+1. Visually inspect the timeseries for any indication of trend/seasonality and if they are additive or multiplicative.
+
+2. Run the ets() function with the "model" argument set to "ZZZ" to determine the best model. The best model from this process is compared with the expected model from (1).
+
+3. Model evaluation on in and out-of-sample performance. 
+
+## 4.1 Cali 1 Store
+
+### 4.11 Inspect The timeseries
+The timeseries is decomposed into its component parts - level, trend, seasonal and errors. This is performed using Seasonal and Trend decomposition using Loess (STL). One particular advantage of using STL is the fact that it can handle a range of seasonalities - not just monthly/quarterly. Finally, the same train/test split defined above in the ARIMA section is used here. 
+
+```{r}
+cali1_stl<-cali1_train[,1]
+stl(cali1_stl,s.window ="period") %>% autoplot 
+```
+
+In STL plots, the  grey bars indicate the relative importance of each component. It can be seen that the seasonal component plays the most important part however, the large grey bar for the trend component indicates that its contribution to the original data/time series is marginal. Consequently, the ETS model expected is given by "A,N,A", where the error type and season type are expected to be additive. 
+
+### 4.12 Determination of Best Model
+```{r}
+cali1_ets<-ets(cali1_train, model="ZZZ") #Evaluate the best model
+cali1_ets
+```
+As seen above, the "best model" is consistent with the expected "A,N,A".
+
+### 4.13 In/ Out-Of-Sample Performance
+
+**In/Out-Of-Sample Performance:**
+```{r}
+cali1_ets_out_sample<-as.data.frame(accuracy(forecast(cali1_ets, h = 20), cali1_test))
+cali1_ets_out_sample %>% kable(caption = "In Sample Performance") %>%  kable_styling("striped")
+```
+
+As expected, the model performance on the test set is worse than on the training set. In the next section, the performance of the Holt-Winters' model is compared to the ARIMA.
+```{r}
+#Plot Residuals
+autoplot(forecast(cali1_ets, h = 20))
+```
+
+**Check Residuals:**
+```{r}
+checkresiduals(cali1_ets)
+```
+
+From the results from the residual plots above appear to be inconclusive. While the time series does exhibit white noise-like behaviour, there is a slight downwards trajectory.The spikes are insignificant (apart from the spike at lag 11, attributable to tandom errors) and the distribution of the errors is normal with mean zero. However, the p-value of the Ljung-Box test is small enough for the null hypothesis to be rejected- an indication that the model shows a lack of fit. 
+
+The inconclusive nature of the residual analyses means that one should "approach with caution" with forecasts from this model.
+
+
+## 4.2 Cali 2 Store
+
+### 4.21 Inspect The Timeseries 
+The timeseries is decomposed into its component parts with STL, in order to inspect the relative importance of the trend, seasonal and remainder components. 
+
+```{r}
+cali2_stl<-cali2_train[,1]
+stl(cali2_stl,s.window ="period") %>% autoplot 
+```
+
+From observing the relative size of the grey bars, it is seen that the trend component does not contribute much to the overall time series and so can be ignored. Consequently, the expected model is the ETS("A,N,A"), with additive errors and seasonality. However, due to the the relative large size of the bars of the seasonal plot, the ETS("A,N,N") model is also explored for its out of sample performance. 
+
+### 4.22 Determination of Best Model
+```{r}
+cali2_ets_1<-ets(cali2_train, model="ZZZ") #Evaluate the best model
+cali2_ets_1
+```
+
+The best model according to the optimisation is given by ETS(A,A,A). However, it can be seen the smoothing parameter for the trend portion is 0.0125 and close to zero. Therefore, the ETS("A,N,A") and ETS("A,N,N") models are also explored in addition to this. 
+
+```{r}
+cali2_ets_2<-ets(cali2_train, model="ANA") #ANA Model
+cali2_ets_3<-ets(cali2_train, model="ANN") #ANN Model
+```
+
+### 4.23 In/Out-of-Sample Performance
+```{r}
+cali2_ets_out_sample<-as.data.frame(accuracy(forecast(cali2_ets_1, h = 19), cali2_test))
+cali2_ets_out_sample<-rbind(cali2_ets_out_sample,accuracy(forecast(cali2_ets_2, h = 19), cali2_test))
+cali2_ets_out_sample<-rbind(cali2_ets_out_sample,accuracy(forecast(cali2_ets_3, h = 19), cali2_test))
+cali2_ets_out_sample$Model<- c("Model 1","Model 1", "Model 2", "Model 2", "Model 3", "Model 3")
+cali2_ets_out_sample<- cali2_ets_out_sample %>% select(Model, everything())
+cali2_ets_out_sample %>% kable(caption = "Out of Sample Performance") %>%  kable_styling("striped")
+```
+While Model 1 performs the best on the training sample, the out of sample/test RMSE is actually lowest for Model 2. This indicates that Model 1 is likely to have been overfitting the test data and for this reason, Model 2 is selected (given by ANA).
+```{r}
+#Plot Forecast
+autoplot(forecast(cali2_ets_2, h = 19))
+```
+```{r}
+checkresiduals(cali2_ets_2)
+```
+Although the p-value of the Ljung-Box test indicates that the null hypothesis can be reject, all visual inspections of the timeseries, spikes and normal distribution point to suitability of the model. 
+
+## 4.3 NY 1 Store
+
+### 4.31 Inspect The Timeseries
+STL is used in order to decompose the timeseries. 
+```{r}
+ny1_stl<-ny1_train[,1]
+stl(ny1_stl,s.window ="period") %>% autoplot 
+```
+It is can be seen that due to growing variance in the data and growing error terms that a multiplicative model is more appropiate. Consequently, potential models to test include "M,A,M", "M,N,M" and "M,A,N" as the grey bars for the trend and seasonal components are relatively large.
+```{r}
+ny1_ets_1<-ets(ny1_train, model="ZZZ")
+ny1_ets_1
+```
+The model from the optimisation is given by the "M,N,M" model. Consequently, the "M,A,M" and "M,A,N" are taken as the other two candidate models to be tested for their out of sample performance. 
+
+### 4.32 Determination of Best Model
+```{r}
+ny1_ets_2<-ets(ny1_train, model="MAM")
+ny1_ets_3<-ets(ny1_train, model="MAN")
+ny1_ets_2
+ny1_ets_3
+```
+
+These three models are tested for their out-of-sample performance.
+
+### 4.33 In/Out-of-Sample Performance
+```{r}
+ny1_ets_out_sample<-as.data.frame(accuracy(forecast(ny1_ets_1, h = 20), ny1_test))
+ny1_ets_out_sample<-rbind(ny1_ets_out_sample,accuracy(forecast(ny1_ets_2, h = 20), ny1_test))
+ny1_ets_out_sample<-rbind(ny1_ets_out_sample,accuracy(forecast(ny1_ets_3, h = 20), ny1_test))
+ny1_ets_out_sample$Model<- c("Model 1","Model 1", "Model 2", "Model 2", "Model 3", "Model 3")
+ny1_ets_out_sample<- ny1_ets_out_sample %>% select(Model, everything())
+ny1_ets_out_sample %>% kable(caption = "Out of Sample Performance") %>%  kable_styling("striped")
+```
+```{r}
+#Plot Forecast
+autoplot(forecast(ny1_ets_1, h = 20))
+```
+Model 1 is therefore selected since it gives the best fit on RMSE for the test set.
+```{r}
+checkresiduals(ny1_ets_1)
+```
+Model 1 also passes on all residual diagnostics, providing more confidence in this model. 
+
+## 4.4 NY 2 Store
+
+### 4.41 Inspect The Timeseries 
+As in previous cases, the timeseries is decomposed in order to inspect the seasonal, trend and error components.
+```{r}
+ny2_stl<-ny2_train[,1]
+stl(ny2_stl,s.window ="period") %>% autoplot 
+```
+From the plots above, it is seen that the components are likely to be additive. However the relatively large grey bar for the trend component indicates that it does not contirbute greatly to the variations in the timeseries. Consequently, potential models to test include "A,A,A", "A,N,A", "A,A,N" and "A,N,N", as the grey bar for the seasonal component also appears to be quite large. 
+
+### 4.42 Determination of Best Model
+```{r}
+ny2_ets_1<-ets(ny2_train, model="ZZZ")
+ny2_ets_1
+```
+The optimisation provides A,N,A as the best model. Therefore, the other three are considered as candidate models. 
+```{r}
+#Candidate Models
+ny2_ets_2<-ets(ny2_train, model="AAA")
+ny2_ets_3<-ets(ny2_train, model="AAN")
+ny2_ets_4<-ets(ny2_train, model="ANN")
+```
+
+### 4.43 In/Out-of-Sample Performance
+```{r}
+ny2_ets_out_sample<-as.data.frame(accuracy(forecast(ny2_ets_1, h = 18), ny2_test))
+ny2_ets_out_sample<-rbind(ny2_ets_out_sample,accuracy(forecast(ny2_ets_2, h = 18), ny2_test))
+ny2_ets_out_sample<-rbind(ny2_ets_out_sample,accuracy(forecast(ny2_ets_3, h = 18), ny2_test))
+ny2_ets_out_sample<-rbind(ny2_ets_out_sample,accuracy(forecast(ny2_ets_4, h = 18), ny2_test))
+ny2_ets_out_sample$Model<- c("Model 1","Model 1", "Model 2", "Model 2", "Model 3", "Model 3", "Model 4", "Model 4")
+ny2_ets_out_sample<- ny2_ets_out_sample %>% select(Model, everything())
+ny2_ets_out_sample %>% kable(caption = "Out of Sample Performance") %>%  kable_styling("striped")
+```
+Given that Model 2 performs the best on the on test RMSE and is therefore selected. 
+```{r}
+#Plot Forecast
+autoplot(forecast(ny2_ets_2, h = 18))
+```
+```{r}
+checkresiduals(ny2_ets_2)
+```
+The residuals generally exhibit a white noise pattern, with lags that are insignificant. However, the distribution appears to be slightly skewed and the Ljung-Box test returns a significant p-value. Consequently, these tests are inconclusive. 
+
+# 5. Performance comparison between Holt-Winters and ARIMA: Summary of All Models and Overall Model Selection
+
+**Summary of best performing models:**
+
+Firstly, a summary of the best of the ARIMA and Holt-Winters models for each store is provided below:
+
+1. Cali1 Store (46673): The best of the ARIMA Models is **ARIMA(1,0,0)(0,1,1)[7]**. The best of the Holt-Winters models is **ETS(A,N,A)**.
+
+2. Cali2 Store (4904): The best of the ARIMA Models is **ARIMA(0,1,1)(0,1,1)[7]**. The best of the Holt-Winters models is **ETS(A,N,A)**.
+
+3. NY1 Store (12631): The best of the ARIMA Models is **ARIMA (0,1,1)(2,0,0)[7]**. The best of the Holt-Winters models is **ETS(M,N,M)**.
+
+4. NY2 Store (20974): The best of the ARIMA Models is **ARIMA (0,0,1)(1,0,0)[7] with non-zero mean**. The best of the Holt-Winters models is **ETS(A,A,A)**.
+
+**Comparison between Holt-Winters and ARIMA Models :** While the various models were fit on a range of Information Criteria (AIC, AICc, BIC), they only include training data and provide no evidence on how well the models are able to generalise. Furthermore, as the likelihood is calculated differently for ARIMA and ETS models, they cannot be compared. 
+Consequently, the in and out of sample perfomance metrics calculated for the models in earlier sections is used for the final selection - specifically, RMSE. Ideally, the best model will provide the lowest RMSE but also a consistent performance between the training and test sample - indicating that it is able to generalise well on unseen data (a compromise between underfitting and overfitting). 
+
+1. **Cali1 Store:**
+Below is the comparison of the ETS(A,N,A) and ARIMA(1,0,0)(0,1,1)[7] models. 
+```{r}
+cali1_overall_fit<-cali1_ets_out_sample #Create a copy to preserve original dataframe
+cali1_overall_fit$Model<-c("Holt-Winters","Holt-Winters")
+cali1_overall_fit<-cali1_overall_fit %>% select(Model, everything()) #Reorder
+#Merge with ARIMA out of sample
+cali1_overall_fit<-rbind(cali1_overall_fit,cali1_out_sample[cali1_out_sample$Model=="Model 1",]) 
+cali1_overall_fit[3:4,1]<-c("ARIMA","ARIMA")
+cali1_overall_fit %>% kable(caption = "Performance Comparison: Holt-Winters VS ARIMA") %>%  kable_styling("striped") 
+```
+On RMSE, the perfomance between the ARIMA model and Holt-Winters are comparable, including the perfomance of the spread of errors on the training and test set. However, given the "approach with caution" warning for the Holt-Winters model in section 4.13 and the slightly lower RMSE for the ARIMA, **ARIMA(1,0,0)(0,1,1)[7]** is selected as the final model. 
+
+2. **Cali2 Store:**
+
+Below is a comparison of the ETS(A,N,A) and ARIMA(0,1,1)(0,1,1)[7] Models.
+```{r}
+cali2_overall_fit<-cali2_ets_out_sample[cali2_ets_out_sample$Model=="Model 2",] #Extract Relevant Rows
+cali2_overall_fit$Model<-c("Holt-Winters","Holt-Winters") #Rename Rows
+#Combine with ARIMA
+cali2_overall_fit<-rbind(cali2_overall_fit,cali2_out_sample[cali2_out_sample$Model=="Model 1",]) 
+cali2_overall_fit[3:4,1]<-c("ARIMA","ARIMA")
+cali2_overall_fit %>% kable(caption = "Performance Comparison: Holt-Winters VS ARIMA") %>%  kable_styling("striped") 
+```
+In this case, the Holt-Winters model given by ETS(A,N,A) gives a clearly superior performance on the in sample and out-of sample sets. Therefore, **ETS(A,N,A)** is selected as the final model.
+
+3. **NY1 Store:**
+
+Below is a comparison of the ETS(M,N,M) and ARIMA (0,1,1)(2,0,0)[7] Models.
+```{r}
+ny1_overall_fit<-ny1_ets_out_sample[ny1_ets_out_sample$Model=="Model 1",] #Extract Relevant Rows
+ny1_overall_fit$Model<-c("Holt-Winters","Holt-Winters") #Rename Rows
+#Combine with ARIMA
+ny1_overall_fit<-rbind(ny1_overall_fit,ny1_out_sample[ny1_out_sample$Model=="Model 1",]) 
+ny1_overall_fit[3:4,1]<-c("ARIMA","ARIMA")
+ny1_overall_fit %>% kable(caption = "Performance Comparison: Holt-Winters VS ARIMA") %>%  kable_styling("striped") 
+```
+While the performance is comprable for the ARIMA and Holt-Winters models, the Holt-Winters model shows superior performance on the test set RMSE. Therefore, **ETS(M,N,M)** is selected as the final model.
+
+4. **NY2 Store:**
+
+Below is a comparison of the ETS(A,A,A) and ARIMA (0,0,1)(1,0,0)[7] Models. 
+```{r}
+ny2_overall_fit<-ny2_ets_out_sample[ny2_ets_out_sample$Model=="Model 2",] #Extract Relevant Rows
+ny2_overall_fit$Model<-c("Holt-Winters","Holt-Winters") #Rename Rows
+#Combine with ARIMA
+ny2_overall_fit<-rbind(ny2_overall_fit,ny2_out_sample[ny2_out_sample$Model=="Model 2",]) 
+ny2_overall_fit[3:4,1]<-c("ARIMA","ARIMA")
+ny2_overall_fit %>% kable(caption = "Performance Comparison: Holt-Winters VS ARIMA") %>%  kable_styling("striped") 
+```
+While the Holt-Winter model provides the lower RMSE on the test sample, the ARIMA model exhibits a narrower spread between the training and test sets. Since there is only a small difference in the RMSE on the test sets and the ARIMA model provides evidence of being able to generalise better, it is preferred. Therefore, **ARIMA (0,0,1)(1,0,0)[7]** is selected as the final model.
+
+# 6. Final Forecast for 06/16/2015 to 06/29/2015 Window
+
+The final models are then trained on the full datasets in order to make a forecast for the 06/16/2015 to 06/29/2015 window. The results will be presented in a separate CSV file. 
+```{r}
+#Make the original, full datasets ts objects
+cali1_final<-ts(cali1[,2], frequency=7, start=c(03,05))
+cali2_final<-ts(cali2[,2], frequency=7, start=c(03,13))
+ny1_final<-ts(ny1[,2], frequency = 7, start=c(03,05))
+ny2_final<-ts(ny2[,2], frequency = 7, start=c(03,20))
+```
+
+```{r}
+#Train final models on the full data set
+
+#Cali1 Final Model: ARIMA(1,0,0)(0,1,1)[7]
+cali1.mfinal<-Arima(cali1_final, order = c(1,0,0), seasonal = list(order = c(0, 1, 1), period=7))
+
+#Cali2 Final Model: ETS(A,N,A)
+cali2.mfinal<-ets(cali2_final, model="ANA")
+
+#NY1 Final Model: ETS(M,N,M)
+ny1.mfinal<-ets(ny1_final, model="MNM")
+
+#NY2 Final Model: ARIMA(0,0,1)(1,0,0)[7]
+ny2.mfinal<-Arima(ny2_final, order = c(0,0,1), seasonal = list(order = c(1, 0, 0), period=7))
+```
+
+```{r}
+#Forecast for 14-day window
+cali1_forecast<-forecast(cali1.mfinal,h=14)
+cali2_forecast<-forecast(cali2.mfinal,h=14)
+ny1_forecast<-forecast(ny1.mfinal,h=14)
+ny2_forecast<-forecast(ny2.mfinal,h=14)
+```
+
+```{r}
+#Report Point Forecasts in Table
+
+#Include Dates
+Dates<-as.character(seq(ymd('2015-06-16'),ymd('2015-06-29'), by = 'days'))
+
+#Extract Mean/Point Forecast
+
+forecast_cali1<-cali1_forecast$mean 
+forecast_cali2<-cali2_forecast$mean
+forecast_ny1<-ny1_forecast$mean
+forecast_ny2<-ny2_forecast$mean
+final_prediction<-cbind(Dates,forecast_cali1,forecast_cali2,forecast_ny1,forecast_ny2)
+
+#Rename Column Names
+colnames(final_prediction)<-c("Dates","California 1 (ID:46673)", "California 2 (ID:4904)", "New York 1 (ID:12631)", "New York 2 (ID:20974)") 
+
+```
+
+```{r}
+#Write CSV
+final_prediction<-as.data.frame(final_prediction)
+final_prediction %>% kable(caption = "Final Prediction") %>%  kable_styling("striped")
+write.csv(final_prediction, "FinalPrediction.csv")
+```
